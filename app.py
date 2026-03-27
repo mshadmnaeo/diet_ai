@@ -13,6 +13,7 @@ Flow:
   5. Charts and tables are displayed in the main area
 """
 
+import os   # ✅ MUST be first
 import streamlit as st
 from PIL import Image
 import traceback
