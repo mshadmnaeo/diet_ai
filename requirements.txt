@@ -1,13 +1,17 @@
-# Diet AI — Python requirements
-# Install with: pip install -r requirements.txt
+# Diet AI — Flan-T5-XL version
+# Install: pip install -r requirements.txt
+#
+# System requirements:
+#   RAM        : 6GB+ recommended
+#   Disk space : 6GB free (for model cache)
+#   Python     : 3.9+
 
-# ── Core ML ───────────────────────────────────────────────────
+# ── AI models (HuggingFace) ────────────────────────────────────
 torch>=2.1.0
 torchvision>=0.16.0
 transformers>=4.38.0
-accelerate>=0.27.0          # needed for device_map="auto"
-sentencepiece>=0.1.99       # Mistral tokenizer dependency
-protobuf>=3.20.0
+accelerate>=0.27.0
+sentencepiece>=0.1.99
 
 # ── Image handling ─────────────────────────────────────────────
 Pillow>=10.0.0
@@ -19,7 +23,6 @@ streamlit>=1.32.0
 matplotlib>=3.8.0
 pandas>=2.1.0
 numpy>=1.26.0
-seaborn>=0.13.0             # optional: for future heatmaps
 
-# ── API / networking ───────────────────────────────────────────
+# ── Networking (Open Food Facts) ──────────────────────────────
 requests>=2.31.0
