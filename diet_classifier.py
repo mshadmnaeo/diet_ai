@@ -1,164 +1,221 @@
 """
 diet_classifier.py
 ------------------
-Uses Mistral-7B-Instruct to classify diet type and generate nutrition data
-from a food name. The LLM acts as a nutrition expert, returning structured
-JSON that our app can parse and display.
+Uses google/flan-t5-xl from HuggingFace for nutrition analysis.
+No API key needed. Fully local. 100% open-source.
 
-Why Mistral?
-  - Fully open-source (Apache 2.0 license)
-  - Runs locally on your machine (no API key needed)
-  - Strong instruction-following capability
-  - 7B parameters is a good balance of speed vs quality
+WHY FLAN-T5-XL over FLAN-T5-LARGE?
+  - Large : 770MB  ~1GB RAM   — good accuracy
+  - XL    : 3GB    ~4GB RAM   — significantly better accuracy
+  - XL has 3 billion parameters vs Large's 770 million
+  - Much better at following complex JSON instructions
+  - More accurate nutrition estimates
+  - Still fast enough on CPU (30-60 seconds per query)
+
+SYSTEM REQUIREMENTS for XL:
+  - RAM         : 6GB+ recommended (4GB minimum)
+  - Disk space  : 6GB free for model cache
+  - CPU         : Any modern CPU works (GPU makes it faster)
+  - Streamlit   : Paid tier or local machine only (free tier = ~1GB RAM)
+
+IF YOU WANT TO GO BACK TO FREE TIER:
+  Change MODEL_NAME to "google/flan-t5-large" (770MB)
 """
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 import json
 import re
+import streamlit as st
+from transformers import pipeline
+import torch
 
-
-# ── Default fallback data if LLM fails ───────────────────────────────────────
+# ── Fallback data if model fails ──────────────────────────────────────────────
 FALLBACK_NUTRITION = {
-    "diet_type": "Unknown",
+    "diet_type":        "Unknown",
     "calories_per_100g": 200,
-    "protein_g": 10,
-    "carbs_g": 25,
-    "fat_g": 8,
-    "fiber_g": 3,
-    "sugar_g": 5,
-    "sodium_mg": 300,
-    "is_vegan": False,
-    "is_vegetarian": False,
-    "is_gluten_free": False,
-    "is_keto_friendly": False,
-    "health_score": 5,
-    "health_tips": "Unable to analyze. Please try again.",
-    "allergens": [],
+    "protein_g":         10.0,
+    "carbs_g":           25.0,
+    "fat_g":              8.0,
+    "fiber_g":            3.0,
+    "sugar_g":            5.0,
+    "sodium_mg":         300,
+    "is_vegan":          False,
+    "is_vegetarian":     False,
+    "is_gluten_free":    False,
+    "is_keto_friendly":  False,
+    "health_score":       5,
+    "health_tips":       "Could not analyze. Please try again.",
+    "allergens":          [],
 }
 
-# ── Diet type descriptions (used in the prompt for better accuracy) ───────────
 DIET_TYPES = [
-    "Keto", "Vegan", "Vegetarian", "Mediterranean", "Paleo",
-    "High-Protein", "Low-Carb", "Balanced", "Junk Food", "Raw Food",
+    "Keto", "Vegan", "Vegetarian", "Mediterranean",
+    "Paleo", "High-Protein", "Low-Carb", "Balanced", "Junk Food",
 ]
 
+# ── Model selection ───────────────────────────────────────────────────────────
+# Change this one line to swap models:
+#   "google/flan-t5-large"   770MB  ~1GB RAM   Streamlit Cloud free tier
+#   "google/flan-t5-xl"      3GB    ~4GB RAM   Local / paid tier  ← THIS FILE
+#   "google/flan-t5-xxl"     11GB   ~14GB RAM  Local with GPU only
+MODEL_NAME = "google/flan-t5-xl"
 
-def load_llm_model(model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"):
+
+@st.cache_resource(show_spinner="Loading Flan-T5-XL (~3GB, first run only)...")
+def load_nutrition_model():
     """
-    Downloads and loads Mistral 7B model + tokenizer.
-    
-    - AutoTokenizer: converts text → numbers (tokens) the model understands
-    - AutoModelForCausalLM: the actual language model that generates text
-    - device_map="auto": uses GPU if available, else CPU
-    - torch_dtype=float16: half-precision to save ~50% RAM
-    
-    This is slow the first time (downloads ~14GB) but cached after that.
+    Load Flan-T5-XL from HuggingFace.
+    Downloads ~3GB on first run, then uses local cache forever.
+    @st.cache_resource ensures it loads exactly once per session.
+
+    torch_dtype=torch.float32 is used because float16 can cause
+    issues on some CPUs — XL is accurate enough without it.
     """
-    print(f"Loading LLM: {model_name}... (first time may take several minutes)")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",          # auto-detect GPU/CPU
-        torch_dtype=torch.float16,  # float16 = half precision = less RAM
-        low_cpu_mem_usage=True,     # load model layer by layer to avoid RAM spike
+    print(f"Loading model: {MODEL_NAME}")
+
+    pipe = pipeline(
+        task="text2text-generation",
+        model=MODEL_NAME,
+        tokenizer=MODEL_NAME,
+        max_new_tokens=400,      # XL can handle longer outputs
+        device="cpu",            # change to device=0 if you have a GPU
+        torch_dtype=torch.float32,
     )
-    model.eval()
-    return tokenizer, model
+    return pipe
 
 
-def classify_diet(food_name: str, tokenizer, model) -> dict:
+def classify_diet(food_name: str) -> dict:
     """
-    Takes a food name and returns a nutrition dictionary.
+    Ask Flan-T5-XL to analyze the food and return structured nutrition data.
 
-    The prompt is carefully structured:
-      1. We tell Mistral to act as a nutrition expert
-      2. We ask for ONLY JSON (no extra text) — makes parsing reliable
-      3. We specify exact keys we need
-      4. We use [INST]...[/INST] which is Mistral's instruction format
-    
-    Returns a dict with all nutrition fields, or FALLBACK_NUTRITION on error.
+    Strategy: three focused prompts instead of one big prompt.
+    XL is smart enough to handle more detail in each prompt.
+      1. Macros (calories, protein, carbs, fat)
+      2. Micros (fiber, sugar, sodium)
+      3. Qualitative (diet type, vegan, health score, tips, allergens)
+
+    Results are merged into one complete nutrition dict.
     """
-    prompt = f"""[INST] You are a professional nutritionist and dietitian.
-Analyze the food item: "{food_name}"
+    pipe = load_nutrition_model()
 
-Return ONLY a valid JSON object. No explanation, no markdown, no extra text.
-Use exactly these keys:
+    # ── Prompt 1: Macronutrients ──────────────────────────────────────────────
+    macro_prompt = f"""As a certified nutritionist, provide the macronutrient content of "{food_name}" per 100 grams.
+Be precise and realistic. Answer in JSON only, no explanation:
+{{"calories_per_100g": <integer>, "protein_g": <decimal>, "carbs_g": <decimal>, "fat_g": <decimal>}}"""
 
-{{
-  "diet_type": "one of: {', '.join(DIET_TYPES)}",
-  "calories_per_100g": <integer>,
-  "protein_g": <float per 100g>,
-  "carbs_g": <float per 100g>,
-  "fat_g": <float per 100g>,
-  "fiber_g": <float per 100g>,
-  "sugar_g": <float per 100g>,
-  "sodium_mg": <integer per 100g>,
-  "is_vegan": <true or false>,
-  "is_vegetarian": <true or false>,
-  "is_gluten_free": <true or false>,
-  "is_keto_friendly": <true or false>,
-  "health_score": <integer 1-10, where 10 is healthiest>,
-  "health_tips": "<one short sentence tip>",
-  "allergens": ["list", "of", "common", "allergens"]
-}}
-[/INST]"""
+    # ── Prompt 2: Micronutrients ──────────────────────────────────────────────
+    micro_prompt = f"""As a certified nutritionist, provide the micronutrient content of "{food_name}" per 100 grams.
+Be precise and realistic. Answer in JSON only, no explanation:
+{{"fiber_g": <decimal>, "sugar_g": <decimal>, "sodium_mg": <integer>}}"""
 
-    # Convert text prompt → token IDs (numbers)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # ── Prompt 3: Qualitative analysis ───────────────────────────────────────
+    qual_prompt = f"""As a certified nutritionist, classify the food "{food_name}".
+Answer in JSON only, no explanation:
+{{"diet_type": "<one of: {', '.join(DIET_TYPES)}>", "is_vegan": <true/false>, "is_vegetarian": <true/false>, "is_gluten_free": <true/false>, "is_keto_friendly": <true/false>, "health_score": <integer 1-10 where 10 is healthiest>, "health_tips": "<one practical tip under 20 words>", "allergens": ["<common allergens as list>"]}}"""
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=400,    # max length of the response
-            temperature=0.1,       # low temperature = more deterministic/consistent
-            do_sample=True,        # enables temperature-based sampling
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    try:
+        macro_raw = pipe(macro_prompt)[0]["generated_text"].strip()
+        micro_raw = pipe(micro_prompt)[0]["generated_text"].strip()
+        qual_raw  = pipe(qual_prompt)[0]["generated_text"].strip()
 
-    # Convert token IDs back to text
-    raw_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    
-    # Extract only the part after [/INST] — that's the model's actual response
-    if "[/INST]" in raw_output:
-        raw_output = raw_output.split("[/INST]")[-1].strip()
+        macro_data = _parse_json(macro_raw)
+        micro_data = _parse_json(micro_raw)
+        qual_data  = _parse_json(qual_raw)
 
-    return _parse_json_response(raw_output, food_name)
+        # Merge all three into one complete dict
+        merged = FALLBACK_NUTRITION.copy()
+        for source in [macro_data, micro_data, qual_data]:
+            if source:
+                merged.update(source)
+
+        return _validate(merged)
+
+    except Exception as e:
+        print(f"Flan-T5-XL error for '{food_name}': {e}")
+        fallback = FALLBACK_NUTRITION.copy()
+        fallback["health_tips"] = f"Model error: {str(e)[:100]}"
+        return fallback
 
 
-def _parse_json_response(raw_text: str, food_name: str) -> dict:
+def _parse_json(text: str) -> dict:
     """
-    Safely extracts JSON from the LLM response.
-    LLMs sometimes add extra words — this handles that gracefully.
+    Safely extract JSON from model output.
+    Handles extra text, markdown fences, and partial responses.
     """
-    # Try to find a JSON block {...}
-    json_match = re.search(r'\{[^{}]*\}', raw_text, re.DOTALL)
-    
-    if json_match:
+    if not text:
+        return {}
+
+    # Strip markdown code fences
+    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Find {...} block anywhere in the text
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if match:
         try:
-            data = json.loads(json_match.group())
-            # Validate required fields exist, fill missing ones from fallback
-            for key, val in FALLBACK_NUTRITION.items():
-                if key not in data:
-                    data[key] = val
-            return data
+            return json.loads(match.group())
         except json.JSONDecodeError:
             pass
 
-    # If JSON parsing fails entirely, return fallback
-    print(f"Warning: Could not parse LLM response for '{food_name}'. Using fallback.")
-    fallback = FALLBACK_NUTRITION.copy()
-    fallback["health_tips"] = f"Could not analyze '{food_name}'. Try a more specific name."
-    return fallback
+    # Last resort: regex extraction of individual numeric values
+    result = {}
+    patterns = {
+        "calories_per_100g": r'"?calories_per_100g"?\s*:\s*(\d+\.?\d*)',
+        "protein_g":         r'"?protein_g"?\s*:\s*(\d+\.?\d*)',
+        "carbs_g":           r'"?carbs_g"?\s*:\s*(\d+\.?\d*)',
+        "fat_g":             r'"?fat_g"?\s*:\s*(\d+\.?\d*)',
+        "fiber_g":           r'"?fiber_g"?\s*:\s*(\d+\.?\d*)',
+        "sugar_g":           r'"?sugar_g"?\s*:\s*(\d+\.?\d*)',
+        "sodium_mg":         r'"?sodium_mg"?\s*:\s*(\d+)',
+        "health_score":      r'"?health_score"?\s*:\s*(\d+)',
+    }
+    for key, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            result[key] = float(m.group(1))
+
+    return result
+
+
+def _validate(data: dict) -> dict:
+    """Ensure all fields exist with correct types. Fill gaps from fallback."""
+    for key, default in FALLBACK_NUTRITION.items():
+        if key not in data or data[key] is None:
+            data[key] = default
+
+    # Clamp health_score 1-10
+    data["health_score"] = max(1, min(10, int(data.get("health_score", 5))))
+
+    # Ensure numeric fields
+    for field in ["calories_per_100g", "protein_g", "carbs_g",
+                  "fat_g", "fiber_g", "sugar_g", "sodium_mg"]:
+        try:
+            data[field] = float(data[field])
+        except (TypeError, ValueError):
+            data[field] = FALLBACK_NUTRITION[field]
+
+    # Ensure booleans
+    for field in ["is_vegan", "is_vegetarian", "is_gluten_free", "is_keto_friendly"]:
+        val = data.get(field, False)
+        if isinstance(val, str):
+            data[field] = val.lower() in ("true", "yes", "1")
+        else:
+            data[field] = bool(val)
+
+    # Ensure allergens is a list
+    if not isinstance(data.get("allergens"), list):
+        data["allergens"] = []
+
+    return data
 
 
 def get_diet_summary(nutrition: dict) -> str:
-    """
-    Returns a human-readable one-line summary of the diet classification.
-    """
-    diet = nutrition.get("diet_type", "Unknown")
-    score = nutrition.get("health_score", "?")
-    cal = nutrition.get("calories_per_100g", "?")
-    return f"{diet} diet · {cal} kcal/100g · Health score: {score}/10"
+    return (
+        f"{nutrition.get('diet_type', 'Unknown')} diet  ·  "
+        f"{nutrition.get('calories_per_100g', '?'):.0f} kcal/100g  ·  "
+        f"Health score: {nutrition.get('health_score', '?')}/10"
+    )
