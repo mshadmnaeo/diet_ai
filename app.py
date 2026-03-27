@@ -17,6 +17,24 @@ import streamlit as st
 from PIL import Image
 import traceback
 
+# ── Load Hugging Face token from Streamlit secrets ───────────────────────────
+HF_TOKEN = None
+
+try:
+    # Option 1: flat structure
+    HF_TOKEN = st.secrets["HF_TOKEN"]
+except KeyError:
+    try:
+        # Option 2: nested structure
+        HF_TOKEN = st.secrets["huggingface"]["token"]
+    except KeyError:
+        HF_TOKEN = None
+
+# Set as environment variable (used by transformers / huggingface_hub)
+if HF_TOKEN:
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
+    os.environ["HF_TOKEN"] = HF_TOKEN
+
 # Local modules
 from food_recognizer import load_clip_model, identify_food, get_top_n_foods
 from diet_classifier import load_llm_model, classify_diet, get_diet_summary
