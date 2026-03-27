@@ -42,12 +42,7 @@ if HF_TOKEN:
 from food_recognizer import load_clip_model, identify_food, get_top_n_foods
 from diet_classifier  import load_nutrition_model, classify_diet, get_diet_summary
 from nutrition_lookup  import fetch_from_open_food_facts, merge_nutrition_data
-from chart_generator   import (
-    build_nutrition_df,
-    plot_macro_pie,
-    plot_nutrient_bars,
-    plot_health_gauge,
-)
+from chart_generator   import build_nutrition_df, plot_macro_pie, plot_nutrient_bars, plot_health_gauge
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
