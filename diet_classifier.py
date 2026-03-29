@@ -1,32 +1,26 @@
 """
 diet_classifier.py
 ------------------
-Uses google/flan-t5-xl from HuggingFace for nutrition analysis.
+Uses a lightweight text model from HuggingFace for nutrition analysis.
 No API key needed. Fully local. 100% open-source.
 
-WHY FLAN-T5-XL over FLAN-T5-LARGE?
-  - Large : 770MB  ~1GB RAM   — good accuracy
-  - XL    : 3GB    ~4GB RAM   — significantly better accuracy
-  - XL has 3 billion parameters vs Large's 770 million
-  - Much better at following complex JSON instructions
-  - More accurate nutrition estimates
-  - Still fast enough on CPU (30-60 seconds per query)
-
-SYSTEM REQUIREMENTS for XL:
-  - RAM         : 6GB+ recommended (4GB minimum)
-  - Disk space  : 6GB free for model cache
-  - CPU         : Any modern CPU works (GPU makes it faster)
-  - Streamlit   : Paid tier or local machine only (free tier = ~1GB RAM)
-
-IF YOU WANT TO GO BACK TO FREE TIER:
-  Change MODEL_NAME to "google/flan-t5-large" (770MB)
+This project uses a small, broadly compatible model so it works with
+newer transformers versions where `text2text-generation` is unavailable.
 """
 
 import json
+import os
 import re
 import streamlit as st
-from transformers import pipeline
 import torch
+
+# Use project-local cache by default so model downloads do not fail on ~/.cache perms.
+project_hf_cache = os.path.join(os.getcwd(), ".hf_cache")
+os.makedirs(project_hf_cache, exist_ok=True)
+os.environ.setdefault("HF_HOME", project_hf_cache)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(project_hf_cache, "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(project_hf_cache, "transformers"))
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # ── Fallback data if model fails ──────────────────────────────────────────────
 FALLBACK_NUTRITION = {
@@ -53,69 +47,68 @@ DIET_TYPES = [
 ]
 
 # ── Model selection ───────────────────────────────────────────────────────────
-# Change this one line to swap models:
-#   "google/flan-t5-large"   770MB  ~1GB RAM   Streamlit Cloud free tier
-#   "google/flan-t5-xl"      3GB    ~4GB RAM   Local / paid tier  ← THIS FILE
-#   "google/flan-t5-xxl"     11GB   ~14GB RAM  Local with GPU only
-MODEL_NAME = "google/flan-t5-xl"
+# Flan-T5-Large gives better instruction following than Base while keeping
+# compatibility with direct seq2seq generation.
+MODEL_NAME = "google/flan-t5-large"
 
 
-@st.cache_resource(show_spinner="Loading Flan-T5-XL (~3GB, first run only)...")
+@st.cache_resource(show_spinner="Loading nutrition model (first run only)...")
 def load_nutrition_model():
     """
-    Load Flan-T5-XL from HuggingFace.
-    Downloads ~3GB on first run, then uses local cache forever.
+    Load a seq2seq instruction model from HuggingFace.
+    Downloads once, then uses local cache.
     @st.cache_resource ensures it loads exactly once per session.
-
-    torch_dtype=torch.float32 is used because float16 can cause
-    issues on some CPUs — XL is accurate enough without it.
     """
     print(f"Loading model: {MODEL_NAME}")
-
-    pipe = pipeline(
-        task="text2text-generation",
-        model=MODEL_NAME,
-        tokenizer=MODEL_NAME,
-        max_new_tokens=400,      # XL can handle longer outputs
-        device="cpu",            # change to device=0 if you have a GPU
-        torch_dtype=torch.float32,
-    )
-    return pipe
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32)
+    model.eval()
+    return model, tokenizer
 
 
 def classify_diet(food_name: str) -> dict:
     """
-    Ask Flan-T5-XL to analyze the food and return structured nutrition data.
+    Ask the model to analyze the food and return structured nutrition data.
 
     Strategy: three focused prompts instead of one big prompt.
-    XL is smart enough to handle more detail in each prompt.
       1. Macros (calories, protein, carbs, fat)
       2. Micros (fiber, sugar, sodium)
       3. Qualitative (diet type, vegan, health score, tips, allergens)
 
     Results are merged into one complete nutrition dict.
     """
-    pipe = load_nutrition_model()
+    model, tokenizer = load_nutrition_model()
 
     # ── Prompt 1: Macronutrients ──────────────────────────────────────────────
-    macro_prompt = f"""As a certified nutritionist, provide the macronutrient content of "{food_name}" per 100 grams.
-Be precise and realistic. Answer in JSON only, no explanation:
-{{"calories_per_100g": <integer>, "protein_g": <decimal>, "carbs_g": <decimal>, "fat_g": <decimal>}}"""
+    macro_prompt = f"""Return ONLY valid minified JSON (no prose, no markdown) for the food "{food_name}" per 100g.
+Use realistic nutrition values.
+Never output all zeros. If uncertain, return reasonable estimates for a typical preparation.
+Schema:
+{{"calories_per_100g":0,"protein_g":0.0,"carbs_g":0.0,"fat_g":0.0}}
+JSON:"""
 
     # ── Prompt 2: Micronutrients ──────────────────────────────────────────────
-    micro_prompt = f"""As a certified nutritionist, provide the micronutrient content of "{food_name}" per 100 grams.
-Be precise and realistic. Answer in JSON only, no explanation:
-{{"fiber_g": <decimal>, "sugar_g": <decimal>, "sodium_mg": <integer>}}"""
+    micro_prompt = f"""Return ONLY valid minified JSON (no prose, no markdown) for the food "{food_name}" per 100g.
+Use realistic nutrition values.
+Never output all zeros. If uncertain, return reasonable estimates for a typical preparation.
+Schema:
+{{"fiber_g":0.0,"sugar_g":0.0,"sodium_mg":0}}
+JSON:"""
 
     # ── Prompt 3: Qualitative analysis ───────────────────────────────────────
-    qual_prompt = f"""As a certified nutritionist, classify the food "{food_name}".
-Answer in JSON only, no explanation:
-{{"diet_type": "<one of: {', '.join(DIET_TYPES)}>", "is_vegan": <true/false>, "is_vegetarian": <true/false>, "is_gluten_free": <true/false>, "is_keto_friendly": <true/false>, "health_score": <integer 1-10 where 10 is healthiest>, "health_tips": "<one practical tip under 20 words>", "allergens": ["<common allergens as list>"]}}"""
+    qual_prompt = f"""Return ONLY valid minified JSON (no prose, no markdown) classifying "{food_name}".
+diet_type must be one of: {', '.join(DIET_TYPES)}.
+Schema:
+{{"diet_type":"Balanced","is_vegan":false,"is_vegetarian":false,"is_gluten_free":false,"is_keto_friendly":false,"health_score":5,"health_tips":"", "allergens":[]}}
+Rules:
+- health_score is integer 1-10.
+- allergens is an array of short strings.
+JSON:"""
 
     try:
-        macro_raw = pipe(macro_prompt)[0]["generated_text"].strip()
-        micro_raw = pipe(micro_prompt)[0]["generated_text"].strip()
-        qual_raw  = pipe(qual_prompt)[0]["generated_text"].strip()
+        macro_raw = _generate_json_text(macro_prompt, model, tokenizer)
+        micro_raw = _generate_json_text(micro_prompt, model, tokenizer)
+        qual_raw  = _generate_json_text(qual_prompt, model, tokenizer)
 
         macro_data = _parse_json(macro_raw)
         micro_data = _parse_json(micro_raw)
@@ -130,10 +123,27 @@ Answer in JSON only, no explanation:
         return _validate(merged)
 
     except Exception as e:
-        print(f"Flan-T5-XL error for '{food_name}': {e}")
+        print(f"Nutrition model error for '{food_name}': {e}")
         fallback = FALLBACK_NUTRITION.copy()
         fallback["health_tips"] = f"Model error: {str(e)[:100]}"
         return fallback
+
+
+def _generate_json_text(prompt: str, model, tokenizer) -> str:
+    """
+    Run deterministic generation for structured JSON-like responses.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=220,
+            do_sample=False,
+            num_beams=1,
+            temperature=None,
+            top_p=None,
+        )
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
 
 
 def _parse_json(text: str) -> dict:
@@ -146,6 +156,8 @@ def _parse_json(text: str) -> dict:
 
     # Strip markdown code fences
     text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+    # Remove leading label-style prefixes like "JSON:" or "Answer:"
+    text = re.sub(r"^(json|answer)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
 
     # Try direct parse first
     try:
@@ -154,7 +166,20 @@ def _parse_json(text: str) -> dict:
         pass
 
     # Find {...} block anywhere in the text
-    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Try to sanitize common JSON issues (single quotes, trailing commas, Python booleans)
+    sanitized = text
+    sanitized = sanitized.replace("'", '"')
+    sanitized = re.sub(r"\bTrue\b", "true", sanitized)
+    sanitized = re.sub(r"\bFalse\b", "false", sanitized)
+    sanitized = re.sub(r",\s*([}\]])", r"\1", sanitized)
+    match = re.search(r"\{.*\}", sanitized, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
@@ -178,6 +203,43 @@ def _parse_json(text: str) -> dict:
         if m:
             result[key] = float(m.group(1))
 
+    # Parse likely string fields when present in raw text.
+    m = re.search(r'"?diet_type"?\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        result["diet_type"] = m.group(1).strip()
+
+    m = re.search(r'"?health_tips"?\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        result["health_tips"] = m.group(1).strip()
+
+    for field in ["is_vegan", "is_vegetarian", "is_gluten_free", "is_keto_friendly"]:
+        m = re.search(rf'"?{field}"?\s*:\s*(true|false|yes|no|1|0)', text, re.IGNORECASE)
+        if m:
+            result[field] = m.group(1).lower() in ("true", "yes", "1")
+
+    # Prose-style fallback parsing (common with instruction models).
+    prose_patterns = {
+        "calories_per_100g": r"(\d+\.?\d*)\s*(?:kcal|calories?)",
+        "protein_g": r"(\d+\.?\d*)\s*(?:g|grams?)\s*(?:of\s*)?protein",
+        "carbs_g": r"(\d+\.?\d*)\s*(?:g|grams?)\s*(?:of\s*)?(?:carbs?|carbohydrates?)",
+        "fat_g": r"(\d+\.?\d*)\s*(?:g|grams?)\s*(?:of\s*)?fat",
+        "fiber_g": r"(\d+\.?\d*)\s*(?:g|grams?)\s*(?:of\s*)?fiber",
+        "sugar_g": r"(\d+\.?\d*)\s*(?:g|grams?)\s*(?:of\s*)?sugar",
+        "sodium_mg": r"(\d+\.?\d*)\s*mg\s*(?:of\s*)?sodium",
+    }
+    for key, pattern in prose_patterns.items():
+        if key not in result:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                result[key] = float(m.group(1))
+
+    # Standalone diet type answer (e.g., "Balanced")
+    if "diet_type" not in result:
+        for d in DIET_TYPES:
+            if re.search(rf"\b{re.escape(d)}\b", text, re.IGNORECASE):
+                result["diet_type"] = d
+                break
+
     return result
 
 
@@ -196,6 +258,11 @@ def _validate(data: dict) -> dict:
         try:
             data[field] = float(data[field])
         except (TypeError, ValueError):
+            data[field] = FALLBACK_NUTRITION[field]
+
+    # Guard against degenerate model outputs (e.g., all zeros).
+    for field in ["calories_per_100g", "protein_g", "carbs_g", "fat_g", "sodium_mg"]:
+        if data[field] <= 0:
             data[field] = FALLBACK_NUTRITION[field]
 
     # Ensure booleans

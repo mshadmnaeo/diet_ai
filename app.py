@@ -17,6 +17,15 @@ Works on Streamlit Cloud free tier.
 import os   # ✅ MUST be first
 import streamlit as st
 from PIL import Image
+
+# Ensure Matplotlib cache/config is writable in restricted environments.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getcwd(), ".matplotlib"))
+# Keep Hugging Face cache local to this project (avoids permission issues in ~/.cache).
+project_hf_cache = os.path.join(os.getcwd(), ".hf_cache")
+os.makedirs(project_hf_cache, exist_ok=True)
+os.environ.setdefault("HF_HOME", project_hf_cache)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(project_hf_cache, "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(project_hf_cache, "transformers"))
 import matplotlib.pyplot as plt
 import traceback
 
@@ -37,6 +46,20 @@ except KeyError:
 if HF_TOKEN:
     os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
     os.environ["HF_TOKEN"] = HF_TOKEN
+
+# Avoid local proxy blocks when downloading Hugging Face models.
+hf_no_proxy_hosts = [
+    "huggingface.co",
+    "hf.co",
+    "cdn-lfs.huggingface.co",
+]
+for no_proxy_key in ("NO_PROXY", "no_proxy"):
+    existing = os.environ.get(no_proxy_key, "")
+    existing_hosts = [h.strip() for h in existing.split(",") if h.strip()]
+    merged_hosts = existing_hosts + [
+        host for host in hf_no_proxy_hosts if host not in existing_hosts
+    ]
+    os.environ[no_proxy_key] = ",".join(merged_hosts)
 
 # Local modules
 from food_recognizer import load_clip_model, identify_food, get_top_n_foods
@@ -75,9 +98,9 @@ def get_clip():
     return load_clip_model()
 
 
-@st.cache_resource(show_spinner="Loading nutrition model Flan-T5-XL (~3GB)...")
+@st.cache_resource(show_spinner="Loading nutrition model...")
 def get_nutrition_model():
-    """Flan-T5-Large for nutrition analysis. ~770MB download on first run."""
+    """Nutrition text model. Download happens once, then cache is reused."""
     return load_nutrition_model()
 
 
@@ -85,7 +108,7 @@ def get_nutrition_model():
 st.title("🥗 Diet AI — Nutrition Predictor")
 st.caption(
     "Upload a food photo or type a food name · "
-    "Powered by CLIP + Flan-T5-XL (Google) · "
+    "Powered by CLIP + Hugging Face nutrition model · "
     "No API keys needed · 100% HuggingFace open-source"
 )
 

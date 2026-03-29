@@ -30,8 +30,18 @@ FOOD_LABELS = [
 def load_clip_model():
     """Load CLIP model and processor. Cached by Streamlit."""
     print("Loading CLIP model (openai/clip-vit-base-patch32)...")
-    model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    try:
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    except Exception as e:
+        msg = str(e)
+        if "ProxyError" in msg or "403 Forbidden" in msg:
+            raise RuntimeError(
+                "Hugging Face download blocked by proxy (403). "
+                "Disable HTTP(S)_PROXY for this app or add Hugging Face domains "
+                "to NO_PROXY, then restart Streamlit."
+            ) from e
+        raise
     model.eval()
     return model, processor
 
