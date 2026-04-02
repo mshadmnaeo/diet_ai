@@ -29,9 +29,15 @@ DAILY_VALUES = {
 }
 
 
+def get_portion_column_name(portion_g: int) -> str:
+    """Return a unique portion column label for nutrition tables."""
+    return "Per portion (100g)" if portion_g == 100 else f"Per {portion_g}g"
+
+
 def build_nutrition_df(nutrition: dict, portion_g: int) -> pd.DataFrame:
     """Build a Pandas DataFrame scaled to the selected portion size."""
     scale = portion_g / 100
+    portion_col = get_portion_column_name(portion_g)
     rows = [
         {"Nutrient": "Calories (kcal)", "Per 100g": nutrition.get("calories_per_100g", 0), "Unit": "kcal"},
         {"Nutrient": "Protein",         "Per 100g": nutrition.get("protein_g", 0),         "Unit": "g"},
@@ -42,8 +48,8 @@ def build_nutrition_df(nutrition: dict, portion_g: int) -> pd.DataFrame:
         {"Nutrient": "Sodium",          "Per 100g": nutrition.get("sodium_mg", 0),          "Unit": "mg"},
     ]
     df = pd.DataFrame(rows)
-    df[f"Per {portion_g}g"] = df["Per 100g"].apply(lambda x: round(x * scale, 1))
-    return df[["Nutrient", "Per 100g", f"Per {portion_g}g", "Unit"]]
+    df[portion_col] = df["Per 100g"].apply(lambda x: round(x * scale, 1))
+    return df[["Nutrient", "Per 100g", portion_col, "Unit"]]
 
 
 def plot_macro_pie(nutrition: dict, food_name: str, portion_g: int) -> plt.Figure:
@@ -157,7 +163,8 @@ def plot_health_gauge(health_score: int) -> plt.Figure:
         ax.plot(theta, [1] * 100, color=color,
                 linewidth=12, solid_capstyle="round")
 
-    needle = (score / 10) * np.pi
+    # Map low scores to left and high scores to right.
+    needle = ((10 - score) / 10) * np.pi
     ax.annotate("", xy=(needle, 0.9), xytext=(needle, 0.1),
                 arrowprops={"arrowstyle": "->", "color": "#333333", "lw": 2.5})
 

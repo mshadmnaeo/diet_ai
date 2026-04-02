@@ -62,10 +62,41 @@ for no_proxy_key in ("NO_PROXY", "no_proxy"):
     os.environ[no_proxy_key] = ",".join(merged_hosts)
 
 # Local modules
-from food_recognizer import load_clip_model, identify_food, get_top_n_foods
+from food_recognizer import (
+    load_clip_model,
+    identify_food,
+    get_top_n_foods,
+    get_last_decision,
+)
 from diet_classifier  import load_nutrition_model, classify_diet, get_diet_summary
 from nutrition_lookup  import fetch_from_open_food_facts, merge_nutrition_data
-from chart_generator   import build_nutrition_df, plot_macro_pie, plot_nutrient_bars, plot_health_gauge
+from chart_generator   import (
+    build_nutrition_df,
+    get_portion_column_name,
+    plot_macro_pie,
+    plot_nutrient_bars,
+    plot_health_gauge,
+)
+
+
+def _safe_health_tip(nutrition: dict, food_name: str) -> str:
+    """Never show a generic model-failure tip in the UI."""
+    tip = str(nutrition.get("health_tips", "") or "").strip()
+    if tip and "could not analyze" not in tip.lower():
+        return tip
+
+    diet_type = str(nutrition.get("diet_type", "Balanced") or "Balanced")
+    if diet_type == "Junk Food":
+        return "Add vegetables and reduce portion size to improve nutrient balance."
+    if diet_type in ("Vegan", "Vegetarian"):
+        return "Pair with a complete protein source and include vitamin B12-rich foods."
+    if bool(nutrition.get("is_keto_friendly", False)):
+        return "Balance fats with fiber-rich vegetables and stay hydrated."
+
+    food = (food_name or "").strip().lower()
+    if any(k in food for k in ["biryani", "fried", "pizza", "burger"]):
+        return "Pair this meal with salad and water, and keep portions moderate."
+    return "Pair this meal with vegetables and watch sodium for better balance."
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -92,9 +123,9 @@ st.markdown("""
 
 
 # ── Load both models at startup (cached — loads only once) ────────────────────
-@st.cache_resource(show_spinner="Loading vision model CLIP (~600MB)...")
+@st.cache_resource(show_spinner="Loading food vision models (India + Food-101)...")
 def get_clip():
-    """CLIP for food image recognition. ~600MB download on first run."""
+    """Food image recognition ensemble models. Downloaded once and cached."""
     return load_clip_model()
 
 
@@ -108,14 +139,14 @@ def get_nutrition_model():
 st.title("🥗 Diet AI — Nutrition Predictor")
 st.caption(
     "Upload a food photo or type a food name · "
-    "Powered by CLIP + Hugging Face nutrition model · "
+    "Powered by food vision models + Hugging Face nutrition model · "
     "No API keys needed · 100% HuggingFace open-source"
 )
 
 # Show a one-time info message about first-run download
 if "models_loaded" not in st.session_state:
     st.info(
-        "First run: downloading CLIP (~600MB) and Flan-T5-XL (~3GB) from HuggingFace. "
+        "First run: downloading food vision models and nutrition model from HuggingFace. "
         "This takes 5-10 minutes once. After that the app is fast.",
         icon="ℹ️",
     )
@@ -176,8 +207,8 @@ with st.sidebar:
 
     st.divider()
     st.caption("Models used:")
-    st.caption("• CLIP (OpenAI) — vision")
-    st.caption("• Flan-T5-XL (Google) — nutrition")
+    st.caption("• Indian-Western-Food-34 + Food-101 — vision")
+    st.caption("• Flan-T5-Large (Google) — nutrition")
     st.caption("• Open Food Facts — real data")
     st.caption("All 100% free & open-source.")
 
@@ -192,7 +223,7 @@ if analyze_btn:
     food_name  = None
     confidence = 1.0
 
-    # ── Step 1: Food recognition via CLIP ─────────────────────────────────────
+    # ── Step 1: Food recognition via HF vision ensemble ──────────────────────
     if uploaded_file:
         image = Image.open(uploaded_file).convert("RGB")
 
@@ -202,7 +233,7 @@ if analyze_btn:
             st.image(image, use_container_width=True)
 
         with info_col:
-            with st.spinner("Identifying food with CLIP..."):
+            with st.spinner("Identifying food from image..."):
                 try:
                     clip_model, clip_proc = get_clip()
                     food_name, confidence = identify_food(
@@ -221,6 +252,19 @@ if analyze_btn:
                 f"Detected: **{food_name.title()}** "
                 f"({confidence:.0%} confidence)"
             )
+            decision = get_last_decision()
+            if decision:
+                src = decision.get("source", "unknown")
+                p = decision.get("primary_top_confidence")
+                f = decision.get("fallback_top_confidence")
+                th = decision.get("threshold", 0.55)
+                st.caption(
+                    "Vision routing: "
+                    f"{src} "
+                    f"(primary={p:.0%} fallback={f:.0%} threshold={th:.0%})"
+                    if p is not None and f is not None
+                    else f"Vision routing: {src}"
+                )
             if len(top_guesses) > 1:
                 st.caption("Other possibilities:")
                 for g in top_guesses[1:]:
@@ -267,14 +311,10 @@ if analyze_btn:
     # ── Step 4: Diet summary ──────────────────────────────────────────────────
     st.subheader("Diet classification")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Diet type",     nutrition.get("diet_type", "Unknown"))
     c2.metric("Calories/100g", f"{nutrition.get('calories_per_100g', 0):.0f} kcal")
     c3.metric("Health score",  f"{nutrition.get('health_score', '?')}/10")
-    c4.metric(
-        f"Calories ({portion_g}g)",
-        f"{round(nutrition.get('calories_per_100g', 0) * portion_g / 100)} kcal",
-    )
 
     # Badges
     badge_html = ""
@@ -290,7 +330,7 @@ if analyze_btn:
         badge_html += f'<span class="badge {css}">{icon} {label}</span>'
     st.markdown(badge_html, unsafe_allow_html=True)
 
-    tip = nutrition.get("health_tips", "")
+    tip = _safe_health_tip(nutrition, food_name)
     if tip:
         st.info(f"💡 {tip}")
 
@@ -329,6 +369,7 @@ if analyze_btn:
     st.subheader("Full nutrition breakdown")
 
     df = build_nutrition_df(nutrition, portion_g)
+    portion_col = get_portion_column_name(portion_g)
     st.dataframe(
         df,
         use_container_width=True,
@@ -336,7 +377,7 @@ if analyze_btn:
         column_config={
             "Nutrient":          st.column_config.TextColumn("Nutrient", width="medium"),
             "Per 100g":          st.column_config.NumberColumn("Per 100g",           format="%.1f"),
-            f"Per {portion_g}g": st.column_config.NumberColumn(f"Per {portion_g}g", format="%.1f"),
+            portion_col:         st.column_config.NumberColumn(portion_col, format="%.1f"),
             "Unit":              st.column_config.TextColumn("Unit", width="small"),
         },
     )

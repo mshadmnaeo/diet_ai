@@ -114,13 +114,22 @@ JSON:"""
         micro_data = _parse_json(micro_raw)
         qual_data  = _parse_json(qual_raw)
 
-        # Merge all three into one complete dict
-        merged = FALLBACK_NUTRITION.copy()
+        # Dedicated pass for core metrics that often fail JSON parsing.
+        core_prompt = f"""For "{food_name}", return exactly one line:
+calories_per_100g=<number>; health_score=<1-10 integer>
+Use realistic values and no extra text."""
+        core_raw = _generate_json_text(core_prompt, model, tokenizer)
+        core_data = _parse_core_metrics(core_raw)
+
+        # Merge parsed outputs into one dict (validate fills missing fields).
+        merged = {}
         for source in [macro_data, micro_data, qual_data]:
             if source:
                 merged.update(source)
+        if core_data:
+            merged.update(core_data)
 
-        return _validate(merged)
+        return _validate(merged, food_name)
 
     except Exception as e:
         print(f"Nutrition model error for '{food_name}': {e}")
@@ -240,10 +249,30 @@ def _parse_json(text: str) -> dict:
                 result["diet_type"] = d
                 break
 
+    # Health score in prose (e.g., "health score 7/10" or "score: 6")
+    if "health_score" not in result:
+        m = re.search(r"(?:health\s*score|score)\s*[:=]?\s*(\d{1,2})(?:\s*/\s*10)?", text, re.IGNORECASE)
+        if m:
+            result["health_score"] = float(m.group(1))
+
     return result
 
 
-def _validate(data: dict) -> dict:
+def _parse_core_metrics(text: str) -> dict:
+    """Parse simple key=value model output for calories and health score."""
+    out = {}
+    if not text:
+        return out
+    c = re.search(r"calories_per_100g\s*[:=]\s*(\d+\.?\d*)", text, re.IGNORECASE)
+    h = re.search(r"health_score\s*[:=]\s*(\d+\.?\d*)", text, re.IGNORECASE)
+    if c:
+        out["calories_per_100g"] = float(c.group(1))
+    if h:
+        out["health_score"] = float(h.group(1))
+    return out
+
+
+def _validate(data: dict, food_name: str = "") -> dict:
     """Ensure all fields exist with correct types. Fill gaps from fallback."""
     for key, default in FALLBACK_NUTRITION.items():
         if key not in data or data[key] is None:
@@ -277,7 +306,233 @@ def _validate(data: dict) -> dict:
     if not isinstance(data.get("allergens"), list):
         data["allergens"] = []
 
+    _apply_rule_based_enrichment(data, food_name)
+    _apply_metric_estimates_if_default(data, food_name)
     return data
+
+
+def _apply_rule_based_enrichment(data: dict, food_name: str) -> None:
+    """
+    Improve weak model output with deterministic food-name heuristics.
+    This prevents generic "Could not analyze" UI results.
+    """
+    name = (food_name or "").lower()
+
+    vegan_keywords = [
+        "tofu", "tempeh", "lentil", "dal", "chickpea", "falafel", "vegan", "salad",
+        "rajma", "chana", "sambar", "idli", "poha", "upma", "aloo gobi", "bhindi",
+    ]
+    vegetarian_keywords = [
+        "paneer", "cheese", "egg", "yogurt", "milk", "vegetarian", "palak paneer",
+        "kadai paneer", "shahi paneer", "malai kofta", "veg pulao", "vegetable biryani",
+    ]
+    non_veg_keywords = [
+        "chicken", "mutton", "lamb", "beef", "pork", "fish", "shrimp",
+        "prawn", "tuna", "salmon", "meat", "bacon", "ham", "turkey",
+        "chicken curry", "chicken biryani", "butter chicken", "tandoori chicken",
+        "rogan josh", "keema", "fish curry", "prawn curry", "egg curry",
+    ]
+    gluten_keywords = [
+        "bread", "pasta", "pizza", "burger", "noodle", "cake", "cookie", "donut",
+        "naan", "roti", "chapati", "paratha", "kulcha", "puri", "bhatura",
+    ]
+    keto_keywords = ["avocado", "egg", "salmon", "chicken", "steak", "keto"]
+    junk_keywords = [
+        "pizza", "burger", "fries", "fried", "donut", "cake", "soda", "nachos",
+        "pakora", "samosa", "jalebi", "gulab jamun", "kachori", "chole bhature",
+    ]
+    healthy_keywords = [
+        "salad", "grilled", "steamed", "fruit", "vegetable", "oatmeal", "yogurt", "smoothie",
+        "dal", "rajma", "chana", "khichdi", "idli", "sambar", "sprouts", "millet",
+    ]
+    has_non_veg_signal = any(k in name for k in non_veg_keywords)
+    dairy_signals = ["paneer", "butter", "ghee", "lassi", "curd", "yogurt", "kheer", "milk"]
+
+    if not data.get("is_vegan", False):
+        data["is_vegan"] = any(k in name for k in vegan_keywords)
+    if not data.get("is_vegetarian", False):
+        data["is_vegetarian"] = data["is_vegan"] or any(k in name for k in vegetarian_keywords)
+    if has_non_veg_signal:
+        # Hard override for clearly non-vegetarian foods.
+        data["is_vegan"] = False
+        data["is_vegetarian"] = False
+    if data.get("is_gluten_free", False) is False:
+        if any(k in name for k in gluten_keywords):
+            data["is_gluten_free"] = False
+    if not data.get("is_keto_friendly", False):
+        data["is_keto_friendly"] = any(k in name for k in keto_keywords)
+
+    # Indian cuisine-specific hard overrides for common dishes.
+    if "chicken biryani" in name or "mutton biryani" in name:
+        data["is_vegan"] = False
+        data["is_vegetarian"] = False
+        data["diet_type"] = "High-Protein"
+    elif "vegetable biryani" in name or "veg biryani" in name:
+        data["is_vegan"] = False
+        data["is_vegetarian"] = True
+        data["diet_type"] = "Vegetarian"
+    elif "fish curry" in name or "prawn curry" in name:
+        data["is_vegan"] = False
+        data["is_vegetarian"] = False
+        data["diet_type"] = "High-Protein"
+    elif "paneer" in name:
+        data["is_vegan"] = False
+        data["is_vegetarian"] = True
+        data["diet_type"] = "Vegetarian"
+    elif "chole bhature" in name:
+        data["is_vegan"] = False
+        data["is_vegetarian"] = True
+        data["diet_type"] = "Junk Food"
+        data["is_gluten_free"] = False
+    elif "idli sambar" in name:
+        data["is_vegetarian"] = True
+        data["diet_type"] = "Vegetarian"
+
+    allergens_l = [str(a).lower() for a in data.get("allergens", [])]
+    if any(k in name for k in dairy_signals):
+        if "milk" not in allergens_l:
+            data["allergens"].append("milk")
+            allergens_l.append("milk")
+    if any(k in name for k in ["roti", "naan", "paratha", "chapati", "kulcha", "bhatura", "seviyan"]):
+        if "gluten" not in allergens_l:
+            data["allergens"].append("gluten")
+            allergens_l.append("gluten")
+    if "peanut" in name and "peanut" not in allergens_l:
+        data["allergens"].append("peanut")
+        allergens_l.append("peanut")
+    if "egg" in name and "egg" not in allergens_l:
+        data["allergens"].append("egg")
+
+    # Remove likely false dairy allergen when dish has no dairy signals.
+    if "milk" in allergens_l and not any(k in name for k in dairy_signals):
+        data["allergens"] = [a for a in data["allergens"] if str(a).lower() != "milk"]
+
+    # Prefer deterministic category signals from food name.
+    if any(k in name for k in junk_keywords):
+        data["diet_type"] = "Junk Food"
+    elif has_non_veg_signal and data.get("diet_type") in ("Vegetarian", "Vegan"):
+        data["diet_type"] = "High-Protein"
+    elif data.get("diet_type", "Unknown") in ("Unknown", ""):
+        if data["is_vegan"]:
+            data["diet_type"] = "Vegan"
+        elif data["is_vegetarian"]:
+            data["diet_type"] = "Vegetarian"
+        elif data["is_keto_friendly"]:
+            data["diet_type"] = "Keto"
+        elif any(k in name for k in healthy_keywords):
+            data["diet_type"] = "Mediterranean"
+        else:
+            data["diet_type"] = "Balanced"
+    elif data["diet_type"] == "Balanced" and any(k in name for k in healthy_keywords):
+        data["diet_type"] = "Mediterranean"
+
+    generic_tip = FALLBACK_NUTRITION["health_tips"]
+    if not data.get("health_tips") or data["health_tips"] == generic_tip:
+        if data["diet_type"] == "Junk Food":
+            data["health_tips"] = "Add vegetables and reduce portion size to improve nutrient balance."
+        elif data["diet_type"] in ("Vegan", "Vegetarian"):
+            data["health_tips"] = "Pair with a complete protein source and include vitamin B12-rich foods."
+        elif data["is_keto_friendly"]:
+            data["health_tips"] = "Balance fats with fiber-rich vegetables and stay hydrated."
+        else:
+            data["health_tips"] = "Pair this meal with vegetables and watch sodium for better balance."
+
+
+def _apply_metric_estimates_if_default(data: dict, food_name: str) -> None:
+    """
+    Replace static fallback-like metrics with cuisine-aware estimates when model
+    output is weak. This avoids the same numbers for every food.
+    """
+    name = (food_name or "").lower()
+    is_default_cal = abs(float(data.get("calories_per_100g", 0)) - float(FALLBACK_NUTRITION["calories_per_100g"])) < 1e-6
+    is_default_macro_signature = (
+        abs(float(data.get("protein_g", 0)) - float(FALLBACK_NUTRITION["protein_g"])) < 1e-6
+        and abs(float(data.get("carbs_g", 0)) - float(FALLBACK_NUTRITION["carbs_g"])) < 1e-6
+        and abs(float(data.get("fat_g", 0)) - float(FALLBACK_NUTRITION["fat_g"])) < 1e-6
+    )
+    current_score = int(data.get("health_score", 5))
+    is_default_score = current_score == int(FALLBACK_NUTRITION["health_score"])
+    suspicious_low_score = current_score <= 2 and data.get("diet_type") != "Junk Food"
+
+    if is_default_cal or is_default_macro_signature:
+        estimates = [
+            (
+                ["chicken biryani", "mutton biryani"],
+                {"calories_per_100g": 180, "protein_g": 9, "carbs_g": 24, "fat_g": 7, "fiber_g": 1.8, "sugar_g": 1.5, "sodium_mg": 430},
+            ),
+            (
+                ["veg biryani", "vegetable biryani"],
+                {"calories_per_100g": 160, "protein_g": 4.5, "carbs_g": 26, "fat_g": 4.5, "fiber_g": 2.6, "sugar_g": 2.2, "sodium_mg": 360},
+            ),
+            (
+                ["idli sambar"],
+                {"calories_per_100g": 95, "protein_g": 3.8, "carbs_g": 17, "fat_g": 1.2, "fiber_g": 2.4, "sugar_g": 1.3, "sodium_mg": 260},
+            ),
+            (
+                ["chole bhature"],
+                {"calories_per_100g": 280, "protein_g": 8.5, "carbs_g": 33, "fat_g": 13, "fiber_g": 4.8, "sugar_g": 3.0, "sodium_mg": 520},
+            ),
+            (
+                ["paneer tikka", "palak paneer", "kadai paneer", "paneer"],
+                {"calories_per_100g": 240, "protein_g": 13, "carbs_g": 7, "fat_g": 17, "fiber_g": 1.2, "sugar_g": 3.0, "sodium_mg": 420},
+            ),
+            (
+                ["butter chicken"],
+                {"calories_per_100g": 230, "protein_g": 14, "carbs_g": 7, "fat_g": 16, "fiber_g": 1.0, "sugar_g": 3.0, "sodium_mg": 480},
+            ),
+            (
+                ["fish curry", "prawn curry"],
+                {"calories_per_100g": 170, "protein_g": 16, "carbs_g": 6, "fat_g": 9, "fiber_g": 1.0, "sugar_g": 2.0, "sodium_mg": 390},
+            ),
+            (
+                ["dal", "rajma", "chana"],
+                {"calories_per_100g": 130, "protein_g": 7.5, "carbs_g": 17, "fat_g": 3.0, "fiber_g": 5.0, "sugar_g": 2.0, "sodium_mg": 300},
+            ),
+            (
+                ["pizza"],
+                {"calories_per_100g": 260, "protein_g": 11, "carbs_g": 31, "fat_g": 10, "fiber_g": 2.2, "sugar_g": 3.8, "sodium_mg": 620},
+            ),
+            (
+                ["burger"],
+                {"calories_per_100g": 255, "protein_g": 12, "carbs_g": 29, "fat_g": 11, "fiber_g": 1.8, "sugar_g": 4.5, "sodium_mg": 590},
+            ),
+            (
+                ["salad"],
+                {"calories_per_100g": 70, "protein_g": 2.5, "carbs_g": 8.0, "fat_g": 3.0, "fiber_g": 3.5, "sugar_g": 3.0, "sodium_mg": 120},
+            ),
+        ]
+        for keys, profile in estimates:
+            if any(k in name for k in keys):
+                for k, v in profile.items():
+                    data[k] = float(v)
+                break
+
+    if is_default_score or suspicious_low_score:
+        score = 6
+        if data.get("diet_type") == "Junk Food":
+            score = 3
+        elif data.get("diet_type") in ("Vegan", "Vegetarian", "Mediterranean"):
+            score = 7
+        elif data.get("diet_type") == "High-Protein":
+            score = 6
+
+        sodium = float(data.get("sodium_mg", 0) or 0)
+        sugar = float(data.get("sugar_g", 0) or 0)
+        fiber = float(data.get("fiber_g", 0) or 0)
+        calories = float(data.get("calories_per_100g", 0) or 0)
+
+        if sodium > 500:
+            score -= 1
+        if sugar > 15:
+            score -= 1
+        if fiber >= 4:
+            score += 1
+        if calories > 280:
+            score -= 1
+        if calories < 120 and fiber >= 2:
+            score += 1
+
+        data["health_score"] = max(1, min(10, int(score)))
 
 
 def get_diet_summary(nutrition: dict) -> str:

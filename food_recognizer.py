@@ -1,93 +1,85 @@
 """
 food_recognizer.py
 ------------------
-Uses CLIP (openai/clip-vit-base-patch32) to identify food from an image.
-~600MB — fits comfortably on Streamlit Cloud free tier.
+Food recognition using a 2-stage Hugging Face ensemble:
+  1) prithivMLmods/Indian-Western-Food-34 (India-focused + Western)
+  2) nateraw/food (Food-101 fallback for broader categories)
 """
 
-from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
-import torch
+from transformers import pipeline
 
-FOOD_LABELS = [
-    "pizza", "salad", "grilled chicken", "sushi", "burger",
-    "pasta", "fruit bowl", "oatmeal", "steak", "vegetable curry",
-    "sandwich", "soup", "fried rice", "tacos", "smoothie",
-    "pancakes", "waffles", "ramen", "biryani", "dal",
-    "idli sambar", "dosa", "chapati", "paratha", "butter chicken",
-    "fish and chips", "caesar salad", "greek salad", "avocado toast",
-    "scrambled eggs", "fried eggs", "boiled eggs", "yogurt parfait",
-    "granola", "muesli", "protein shake", "wrap", "quesadilla",
-    "nachos", "spring rolls", "dumplings", "pad thai", "pho",
-    "hummus", "falafel", "shawarma", "kebab", "roast chicken",
-    "mashed potato", "french fries", "sweet potato", "corn",
-    "broccoli", "stir fry vegetables", "tofu", "tempeh",
-    "chocolate cake", "ice cream", "cheesecake", "apple pie",
-    "cookie", "brownie", "muffin", "donut",
-]
+PRIMARY_MODEL = "prithivMLmods/Indian-Western-Food-34"
+FALLBACK_MODEL = "nateraw/food"
+PRIMARY_CONFIDENCE_THRESHOLD = 0.55
+_LAST_DECISION = {}
 
 
 def load_clip_model():
-    """Load CLIP model and processor. Cached by Streamlit."""
-    print("Loading CLIP model (openai/clip-vit-base-patch32)...")
-    try:
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    except Exception as e:
-        msg = str(e)
-        if "ProxyError" in msg or "403 Forbidden" in msg:
-            raise RuntimeError(
-                "Hugging Face download blocked by proxy (403). "
-                "Disable HTTP(S)_PROXY for this app or add Hugging Face domains "
-                "to NO_PROXY, then restart Streamlit."
-            ) from e
-        raise
-    model.eval()
-    return model, processor
+    """
+    Backward-compatible loader name used by app.py.
+    Returns image-classification pipelines for primary and fallback models.
+    """
+    print(f"Loading primary food model: {PRIMARY_MODEL}")
+    primary = pipeline("image-classification", model=PRIMARY_MODEL, device="cpu")
+    print(f"Loading fallback food model: {FALLBACK_MODEL}")
+    fallback = pipeline("image-classification", model=FALLBACK_MODEL, device="cpu")
+    return primary, fallback
+
+
+def _normalize_preds(preds: list[dict]) -> list[dict]:
+    out = []
+    for p in preds:
+        label = str(p.get("label", "")).replace("_", " ").strip().lower()
+        score = float(p.get("score", 0.0))
+        if label:
+            out.append({"food": label, "confidence": score})
+    return out
+
+
+def _choose_predictions(primary_preds: list[dict], fallback_preds: list[dict]) -> list[dict]:
+    if primary_preds and primary_preds[0]["confidence"] >= PRIMARY_CONFIDENCE_THRESHOLD:
+        return primary_preds
+    return fallback_preds if fallback_preds else primary_preds
+
+
+def _run_ensemble(image: Image.Image, primary_pipe, fallback_pipe, top_k: int = 5) -> tuple[list[dict], str]:
+    primary = _normalize_preds(primary_pipe(image, top_k=max(5, top_k)))
+    fallback = _normalize_preds(fallback_pipe(image, top_k=max(5, top_k)))
+    chosen = _choose_predictions(primary, fallback)
+    source = "primary"
+    if chosen == fallback and fallback:
+        source = "fallback"
+    if not chosen:
+        source = "none"
+
+    global _LAST_DECISION
+    _LAST_DECISION = {
+        "source": source,
+        "primary_top_confidence": primary[0]["confidence"] if primary else None,
+        "fallback_top_confidence": fallback[0]["confidence"] if fallback else None,
+        "threshold": PRIMARY_CONFIDENCE_THRESHOLD,
+    }
+    return chosen, source
+
+
+def get_last_decision() -> dict:
+    """Expose latest routing decision for UI/debugging."""
+    return dict(_LAST_DECISION)
 
 
 def identify_food(image: Image.Image, model, processor) -> tuple[str, float]:
     """
-    Identify the food in an image using CLIP zero-shot classification.
+    Identify food using primary model and confidence-based fallback.
     Returns (food_name, confidence_score 0.0-1.0).
     """
-    text_inputs = [f"a photo of {label}" for label in FOOD_LABELS]
-
-    inputs = processor(
-        text=text_inputs,
-        images=image,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    probs   = outputs.logits_per_image.softmax(dim=1)
-    top_idx = probs.argmax(dim=1).item()
-    return FOOD_LABELS[top_idx], float(probs[0][top_idx])
+    chosen, _ = _run_ensemble(image, model, processor, top_k=5)
+    if not chosen:
+        return "unknown food", 0.0
+    return chosen[0]["food"], chosen[0]["confidence"]
 
 
 def get_top_n_foods(image: Image.Image, model, processor, n: int = 3) -> list[dict]:
-    """Return the top-N food predictions with confidence scores."""
-    text_inputs = [f"a photo of {label}" for label in FOOD_LABELS]
-
-    inputs = processor(
-        text=text_inputs,
-        images=image,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    )
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    probs       = outputs.logits_per_image.softmax(dim=1)[0]
-    top_indices = probs.topk(n).indices.tolist()
-
-    return [
-        {"food": FOOD_LABELS[idx], "confidence": float(probs[idx])}
-        for idx in top_indices
-    ]
+    """Return top-N predictions from confidence-selected model path."""
+    chosen, _ = _run_ensemble(image, model, processor, top_k=max(5, n))
+    return chosen[:n]
